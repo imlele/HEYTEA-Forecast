@@ -188,22 +188,98 @@ with tab1:
 
     if uploaded_file:
         df_raw = pd.read_excel(uploaded_file)
-        df_clean = clean_hourly_data(df_raw)
 
-        st.write("Preview")
-        st.dataframe(df_clean.head(50))
+        st.subheader("Raw File Preview")
+        st.dataframe(df_raw.head(30))
 
-        if st.button("Upload Hourly Data"):
-            records = df_clean.to_dict("records")
+        try:
+            df_clean = clean_hourly_data(df_raw)
 
-            for i in range(0, len(records), 500):
-                supabase.table("sales_hourly").upsert(
-                    records[i:i + 500],
-                    on_conflict="sales_date,sales_hour,sku_no"
-                ).execute()
+            st.subheader("Cleaned Data Preview")
+            st.dataframe(df_clean.head(100))
 
-            st.success(f"Uploaded {len(records)} hourly rows.")
+            st.write("Cleaned rows:", len(df_clean))
+            st.write("Date range:", df_clean["sales_date"].min(), "to", df_clean["sales_date"].max())
+            st.write("Unique SKUs:", df_clean["sku_no"].nunique())
+            st.write("Total Qty:", df_clean["qty"].sum())
+            st.write("Total Orders:", df_clean["ord_qty"].sum())
 
+            duplicate_count = df_clean.duplicated(
+                subset=["sales_date", "sales_hour", "sku_no"]
+            ).sum()
+
+            st.write("Duplicate rows:", duplicate_count)
+
+            if duplicate_count > 0:
+                st.warning("Duplicate sales_date + sales_hour + sku_no rows found. They will be aggregated before upload.")
+
+                df_clean = (
+                    df_clean
+                    .groupby(
+                        ["sales_date", "sales_hour", "sku_no", "sku_name"],
+                        as_index=False
+                    )
+                    .agg({
+                        "qty": "sum",
+                        "ord_qty": "sum"
+                    })
+                )
+
+                st.subheader("After Duplicate Aggregation")
+                st.dataframe(df_clean.head(100))
+                st.write("Final rows:", len(df_clean))
+
+            confirm_upload = st.checkbox(
+                "I confirm the cleaned data is correct and ready to upload."
+            )
+
+            if confirm_upload:
+                if st.button("Upload Cleaned Hourly Data"):
+                    records = df_clean.to_dict("records")
+
+                    uploaded_rows = 0
+                    failed_batches = []
+
+                    progress = st.progress(0)
+
+                    for i in range(0, len(records), 500):
+                        batch = records[i:i + 500]
+
+                        try:
+                            supabase.table("sales_hourly").upsert(
+                                batch,
+                                on_conflict="sales_date,sales_hour,sku_no"
+                            ).execute()
+
+                            uploaded_rows += len(batch)
+
+                        except Exception as e:
+                            failed_batches.append({
+                                "start_row": i,
+                                "end_row": i + len(batch),
+                                "error": str(e)
+                            })
+
+                        progress.progress(
+                            min((i + 500) / len(records), 1.0)
+                        )
+
+                    if failed_batches:
+                        st.error("Some batches failed.")
+                        st.dataframe(pd.DataFrame(failed_batches))
+                    else:
+                        st.success(f"Upload complete: {uploaded_rows} rows uploaded/upserted.")
+
+                    st.subheader("Upload Summary")
+                    st.write("Uploaded rows:", uploaded_rows)
+                    st.write("Date range:", df_clean["sales_date"].min(), "to", df_clean["sales_date"].max())
+                    st.write("Unique SKUs:", df_clean["sku_no"].nunique())
+                    st.write("Total Qty:", df_clean["qty"].sum())
+                    st.write("Total Orders:", df_clean["ord_qty"].sum())
+
+        except Exception as e:
+            st.error("Failed to clean uploaded file.")
+            st.exception(e)
 
 with tab2:
     st.header("Upload Screenshot / Daily SKU Sales")
