@@ -1,72 +1,334 @@
-import joblib
+import streamlit as st
 import pandas as pd
-from fastapi import FastAPI
-from pydantic import BaseModel
+import numpy as np
+import joblib
+from supabase import create_client
+from datetime import datetime
+
+st.set_page_config(page_title="HEYTEA Forecast", layout="wide")
+
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 model = joblib.load("item_after_cutoff_model.pkl")
 
-app = FastAPI()
-
 FEATURES = [
-    "sku_no商品规格编码",
+    "sku_no",
     "qty_before_cutoff",
     "lag_1_day_qty",
     "lag_7_day_qty",
+    "lag_14_day_qty",
     "rolling_7d_avg",
+    "rolling_14d_avg",
+    "store_qty_before_cutoff",
+    "store_transactions_before_cutoff",
+    "sku_qty_last_hour",
+    "store_qty_last_hour",
+    "store_transactions_last_hour",
     "sku_sales_share",
-    "temp_max",
-    "precipitation",
+    "top5_flag",
     "day_of_week",
     "month",
     "is_holiday",
-    "is_promo",
-    "closing_hour"
+    "closing_hour",
+    "temp_max",
+    "precipitation",
 ]
 
-class PredictInput(BaseModel):
-    sku_no: int
-    qty_before_cutoff: float
-    lag_1_day_qty: float = 0
-    lag_7_day_qty: float = 0
-    rolling_7d_avg: float = 0
-    sku_sales_share: float = 0
-    temp_max: float
-    precipitation: float = 0
-    date: str
-    is_holiday: bool = False
-    is_promo: bool = False
-    closing_hour: int = 22
 
-@app.get("/")
-def health():
-    return {"status": "ok"}
+def upload_batches(table, records, batch_size=500):
+    for i in range(0, len(records), batch_size):
+        supabase.table(table).upsert(
+            records[i:i + batch_size]
+        ).execute()
 
-@app.post("/predict")
-def predict(input: PredictInput):
-    dt = pd.to_datetime(input.date)
 
-    row = pd.DataFrame([{
-        "sku_no商品规格编码": input.sku_no,
-        "qty_before_cutoff": input.qty_before_cutoff,
-        "lag_1_day_qty": input.lag_1_day_qty,
-        "lag_7_day_qty": input.lag_7_day_qty,
-        "rolling_7d_avg": input.rolling_7d_avg,
-        "sku_sales_share": input.sku_sales_share,
-        "temp_max": input.temp_max,
-        "precipitation": input.precipitation,
-        "day_of_week": dt.dayofweek,
-        "month": dt.month,
-        "is_holiday": int(input.is_holiday),
-        "is_promo": int(input.is_promo),
-        "closing_hour": input.closing_hour
-    }])
+def clean_hourly_data(df):
+    df["sales_date"] = pd.to_datetime(
+        df["report_date统计时间"],
+        errors="coerce"
+    )
 
-    prediction = model.predict(row[FEATURES])[0]
-    prediction = max(0, round(float(prediction)))
+    df = df[df["sales_date"].notna()].copy()
+
+    df["sales_hour"] = pd.to_numeric(df["report_hour时段"], errors="coerce")
+    df["sku_no"] = pd.to_numeric(df["sku_no商品规格编码"], errors="coerce")
+    df["qty"] = pd.to_numeric(df["qty商品数量"], errors="coerce").fillna(0)
+    df["ord_qty"] = pd.to_numeric(df["ord_qty订单数"], errors="coerce").fillna(0)
+
+    df = df.dropna(subset=["sales_hour", "sku_no", "sku_name商品名称"])
+
+    df["sku_no"] = df["sku_no"].astype("int64")
+
+    df = df[
+        df["sku_no"].astype(str).str.startswith("3300")
+    ].copy()
+
+    return pd.DataFrame({
+        "sales_date": df["sales_date"].dt.strftime("%Y-%m-%d"),
+        "sales_hour": df["sales_hour"].astype(int),
+        "sku_no": df["sku_no"].astype(int),
+        "sku_name": df["sku_name商品名称"].astype(str),
+        "qty": df["qty"].astype(float),
+        "ord_qty": df["ord_qty"].astype(float),
+    })
+
+
+def get_daily_history(sku_no, date):
+    date = pd.to_datetime(date)
+
+    start_date = (date - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+    end_date = (date - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+    res = (
+        supabase.table("daily_sku_sales")
+        .select("*")
+        .eq("sku_no", sku_no)
+        .gte("sales_date", start_date)
+        .lte("sales_date", end_date)
+        .execute()
+    )
+
+    hist = pd.DataFrame(res.data)
+
+    if hist.empty:
+        return {
+            "lag_1_day_qty": 0,
+            "lag_7_day_qty": 0,
+            "lag_14_day_qty": 0,
+            "rolling_7d_avg": 0,
+            "rolling_14d_avg": 0,
+        }
+
+    hist["sales_date"] = pd.to_datetime(hist["sales_date"])
+    hist["daily_qty"] = pd.to_numeric(hist["daily_qty"], errors="coerce").fillna(0)
+
+    def get_lag(days):
+        target_date = date - pd.Timedelta(days=days)
+        row = hist[hist["sales_date"] == target_date]
+        return float(row["daily_qty"].iloc[0]) if not row.empty else 0
+
+    last_7 = hist[hist["sales_date"] >= date - pd.Timedelta(days=7)]
+    last_14 = hist[hist["sales_date"] >= date - pd.Timedelta(days=14)]
 
     return {
-        "sku_no": input.sku_no,
-        "date": input.date,
-        "cutoff_hour": input.closing_hour - 4,
-        "predicted_after_cutoff": prediction
+        "lag_1_day_qty": get_lag(1),
+        "lag_7_day_qty": get_lag(7),
+        "lag_14_day_qty": get_lag(14),
+        "rolling_7d_avg": float(last_7["daily_qty"].mean()) if not last_7.empty else 0,
+        "rolling_14d_avg": float(last_14["daily_qty"].mean()) if not last_14.empty else 0,
     }
+
+
+def predict_one(row):
+    sales_date = pd.to_datetime(row["date"])
+
+    history = get_daily_history(
+        int(row["sku_no"]),
+        sales_date
+    )
+
+    store_qty_before_cutoff = float(row["store_qty_before_cutoff"])
+    qty_before_cutoff = float(row["qty_before_cutoff"])
+
+    sku_sales_share = (
+        qty_before_cutoff / store_qty_before_cutoff
+        if store_qty_before_cutoff > 0
+        else 0
+    )
+
+    feature_row = {
+        "sku_no": int(row["sku_no"]),
+        "qty_before_cutoff": qty_before_cutoff,
+
+        **history,
+
+        "store_qty_before_cutoff": store_qty_before_cutoff,
+        "store_transactions_before_cutoff": float(row["store_transactions_before_cutoff"]),
+
+        "sku_qty_last_hour": float(row["sku_qty_last_hour"]),
+        "store_qty_last_hour": float(row["store_qty_last_hour"]),
+        "store_transactions_last_hour": float(row["store_transactions_last_hour"]),
+
+        "sku_sales_share": sku_sales_share,
+        "top5_flag": int(row.get("top5_flag", 0)),
+
+        "day_of_week": int(sales_date.dayofweek),
+        "month": int(sales_date.month),
+        "is_holiday": int(row.get("is_holiday", 0)),
+
+        "closing_hour": int(row["closing_hour"]),
+        "temp_max": float(row["temp_max"]),
+        "precipitation": float(row["precipitation"]),
+    }
+
+    X = pd.DataFrame([feature_row])[FEATURES]
+    pred = model.predict(X)[0]
+
+    return max(0, round(float(pred)))
+
+
+tab1, tab2, tab3 = st.tabs([
+    "1. Upload Hourly Data",
+    "2. Upload Screenshot/Daily Data",
+    "3. Predict"
+])
+
+
+with tab1:
+    st.header("Upload Hourly Sales Data to Supabase")
+
+    uploaded_file = st.file_uploader(
+        "Upload hourly sales Excel",
+        type=["xlsx", "xls"],
+        key="hourly_upload"
+    )
+
+    if uploaded_file:
+        df_raw = pd.read_excel(uploaded_file)
+        df_clean = clean_hourly_data(df_raw)
+
+        st.write("Preview")
+        st.dataframe(df_clean.head(50))
+
+        if st.button("Upload Hourly Data"):
+            records = df_clean.to_dict("records")
+
+            for i in range(0, len(records), 500):
+                supabase.table("sales_hourly").upsert(
+                    records[i:i + 500],
+                    on_conflict="sales_date,sales_hour,sku_no"
+                ).execute()
+
+            st.success(f"Uploaded {len(records)} hourly rows.")
+
+
+with tab2:
+    st.header("Upload Screenshot / Daily SKU Sales")
+
+    st.info("For now, paste or upload cleaned daily screenshot data: date, sku_no, sku_name, daily_qty.")
+
+    daily_file = st.file_uploader(
+        "Upload daily SKU sales CSV/Excel",
+        type=["csv", "xlsx", "xls"],
+        key="daily_upload"
+    )
+
+    if daily_file:
+        if daily_file.name.endswith(".csv"):
+            daily_df = pd.read_csv(daily_file)
+        else:
+            daily_df = pd.read_excel(daily_file)
+
+        daily_df["sales_date"] = pd.to_datetime(daily_df["sales_date"]).dt.strftime("%Y-%m-%d")
+        daily_df["sku_no"] = daily_df["sku_no"].astype(int)
+        daily_df["sku_name"] = daily_df["sku_name"].astype(str)
+        daily_df["daily_qty"] = pd.to_numeric(daily_df["daily_qty"], errors="coerce").fillna(0)
+
+        daily_clean = daily_df[[
+            "sales_date",
+            "sku_no",
+            "sku_name",
+            "daily_qty"
+        ]].copy()
+
+        daily_clean["source"] = "screenshot"
+
+        st.dataframe(daily_clean)
+
+        if st.button("Upload Daily Screenshot Data"):
+            records = daily_clean.to_dict("records")
+
+            for i in range(0, len(records), 500):
+                supabase.table("daily_sku_sales").upsert(
+                    records[i:i + 500],
+                    on_conflict="sales_date,sku_no"
+                ).execute()
+
+            st.success(f"Uploaded {len(records)} daily rows.")
+
+
+with tab3:
+    st.header("Predict After-Cutoff Sales")
+
+    st.info("Upload a prediction input table, or enter one item manually.")
+
+    mode = st.radio("Input mode", ["Manual", "Upload Table"])
+
+    if mode == "Manual":
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            date = st.date_input("Date")
+            sku_no = st.number_input("SKU No", value=33000029, step=1)
+            sku_name = st.text_input("SKU Name", value="椰椰芒芒")
+            qty_before_cutoff = st.number_input("Qty Before Cutoff", value=0.0)
+
+        with col2:
+            store_qty_before_cutoff = st.number_input("Store Qty Before Cutoff", value=0.0)
+            store_transactions_before_cutoff = st.number_input("Store Transactions Before Cutoff", value=0.0)
+            sku_qty_last_hour = st.number_input("SKU Qty Last Hour", value=0.0)
+            store_qty_last_hour = st.number_input("Store Qty Last Hour", value=0.0)
+
+        with col3:
+            store_transactions_last_hour = st.number_input("Store Transactions Last Hour", value=0.0)
+            closing_hour = st.number_input("Closing Hour", value=21, step=1)
+            temp_max = st.number_input("Temp Max", value=25.0)
+            precipitation = st.number_input("Precipitation", value=0.0)
+            is_holiday = st.checkbox("Holiday")
+            top5_flag = st.checkbox("Top 5 SKU")
+
+        if st.button("Predict"):
+            row = {
+                "date": str(date),
+                "sku_no": sku_no,
+                "sku_name": sku_name,
+                "qty_before_cutoff": qty_before_cutoff,
+                "store_qty_before_cutoff": store_qty_before_cutoff,
+                "store_transactions_before_cutoff": store_transactions_before_cutoff,
+                "sku_qty_last_hour": sku_qty_last_hour,
+                "store_qty_last_hour": store_qty_last_hour,
+                "store_transactions_last_hour": store_transactions_last_hour,
+                "closing_hour": closing_hour,
+                "temp_max": temp_max,
+                "precipitation": precipitation,
+                "is_holiday": int(is_holiday),
+                "top5_flag": int(top5_flag),
+            }
+
+            prediction = predict_one(row)
+
+            st.success(f"Predicted after-cutoff sales: {prediction} cups")
+
+    else:
+        pred_file = st.file_uploader(
+            "Upload prediction input CSV/Excel",
+            type=["csv", "xlsx", "xls"],
+            key="predict_upload"
+        )
+
+        if pred_file:
+            if pred_file.name.endswith(".csv"):
+                pred_df = pd.read_csv(pred_file)
+            else:
+                pred_df = pd.read_excel(pred_file)
+
+            predictions = []
+
+            for _, row in pred_df.iterrows():
+                pred = predict_one(row)
+                predictions.append(pred)
+
+            pred_df["predicted_after_cutoff"] = predictions
+
+            st.dataframe(pred_df)
+
+            csv = pred_df.to_csv(index=False, encoding="utf-8-sig")
+            st.download_button(
+                "Download Prediction Result",
+                csv,
+                "prediction_result.csv",
+                "text/csv"
+            )
