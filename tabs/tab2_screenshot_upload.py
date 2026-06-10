@@ -1,5 +1,6 @@
 import streamlit as st
 from datetime import date
+from PIL import Image
 
 from utils.openai_vision import detect_daily_sku_rows_from_long_screenshot
 from utils.cleaning import (
@@ -11,7 +12,10 @@ from utils.supabase_client import insert_rows, upsert_rows
 
 def render_tab2_screenshot_upload():
     st.header("Tab 2: Upload Daily SKU Screenshot")
-    st.caption("This uses OpenAI to detect rows, then uploads confirmed data into `daily_sku_sales`.")
+    st.caption(
+        "Upload a screenshot image. OpenAI will detect the daily SKU sales data, "
+        "then you can review and upload it into `daily_sku_sales`."
+    )
 
     sale_date = st.date_input(
         "Sales date for this screenshot",
@@ -19,10 +23,12 @@ def render_tab2_screenshot_upload():
         key="daily_sku_sale_date",
     )
 
-    uploaded_file = st.file_uploader(
-        "Upload long screenshot",
-        type=["png", "jpg", "jpeg"],
-        key="daily_sku_screenshot_file",
+    # Image upload only
+    uploaded_image = st.file_uploader(
+        "Upload screenshot image",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=False,
+        key="daily_sku_screenshot_image",
     )
 
     upload_mode = st.radio(
@@ -35,35 +41,50 @@ def render_tab2_screenshot_upload():
         key="daily_sku_upload_mode",
     )
 
-    if uploaded_file is None:
-        st.info("Upload a screenshot to start.")
+    if uploaded_image is None:
+        st.info("Upload a screenshot image to start.")
         return
 
-    st.image(
-        uploaded_file,
-        caption="Uploaded screenshot",
-        use_container_width=True,
-    )
+    # Validate image
+    try:
+        image = Image.open(uploaded_image)
+        st.image(
+            image,
+            caption=f"Uploaded image: {uploaded_image.name}",
+            use_container_width=True,
+        )
+
+        # Reset pointer so OpenAI function can read the uploaded file again
+        uploaded_image.seek(0)
+
+    except Exception as e:
+        st.error("The uploaded file is not a valid image.")
+        st.exception(e)
+        return
 
     if st.button("Detect data with OpenAI", key="detect_daily_sku_btn"):
         try:
-            detected_df = detect_daily_sku_rows_from_long_screenshot(uploaded_file)
+            uploaded_image.seek(0)
+
+            detected_df = detect_daily_sku_rows_from_long_screenshot(uploaded_image)
 
             if detected_df.empty:
-                st.warning("No rows detected. Try a clearer screenshot or crop closer to the table.")
+                st.warning(
+                    "No rows detected. Try uploading a clearer screenshot or cropping closer to the table."
+                )
                 return
 
             cleaned_df = clean_daily_sku_sales_df(
                 detected_df,
                 sale_date=sale_date,
-                source_file=uploaded_file.name,
+                source_file=uploaded_image.name,
             )
 
             st.session_state["daily_sku_detected_df"] = cleaned_df
             st.success(f"Detected {len(cleaned_df)} valid rows.")
 
         except Exception as e:
-            st.error("OpenAI detection failed.")
+            st.error("OpenAI image detection failed.")
             st.exception(e)
 
     if "daily_sku_detected_df" not in st.session_state:
@@ -85,7 +106,10 @@ def render_tab2_screenshot_upload():
         try:
             rows = dataframe_to_supabase_rows(edited_df)
 
-            table_name = st.secrets.get("DAILY_SKU_SALES_TABLE", "daily_sku_sales")
+            table_name = st.secrets.get(
+                "DAILY_SKU_SALES_TABLE",
+                "daily_sku_sales",
+            )
 
             if upload_mode == "Upsert / replace duplicate rows":
                 response = upsert_rows(
